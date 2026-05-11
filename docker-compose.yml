@@ -1,0 +1,118 @@
+# ============================================================
+# Solar Finance Core — Stack Orchestration
+# ============================================================
+# Services:
+#   postgres — PostgreSQL 16 + TimescaleDB extension
+#   redis    — Redis 7 for caching / queues
+#   ollama   — Local LLM runtime (Qwen 2.5 72B Q4_K_M)
+#   api      — FastAPI backend skeleton
+#
+# Network: solar_net (internal only; only api exposes to host)
+# Data: named volumes for postgres & ollama persistence
+# ============================================================
+
+services:
+
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: solar_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./services/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - solar_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: solar_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - solar_net
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: solar_ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT}:11434"
+    volumes:
+      - /Users/solar-runner/.ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - solar_net
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: solar_api
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      OLLAMA_HOST: ollama
+      OLLAMA_PORT: 11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      API_LOG_LEVEL: ${API_LOG_LEVEL}
+      ENVIRONMENT: ${ENVIRONMENT}
+    ports:
+      - "${API_PORT}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - solar_net
+
+volumes:
+  postgres_data:
+    name: solar_postgres_data
+  redis_data:
+    name: solar_redis_data
+  ollama_data:
+    name: solar_ollama_data
+
+networks:
+  solar_net:
+    name: solar_net
+    driver: bridge

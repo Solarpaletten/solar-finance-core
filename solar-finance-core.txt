@@ -1,0 +1,32 @@
+.
+├── Dockerfile.api
+├── Makefile
+├── README.md
+├── docker-compose.yml
+├── scripts
+│   ├── download_qwen.sh
+│   └── health_check.sh
+├── services
+│   ├── api
+│   │   ├── config.py
+│   │   ├── db
+│   │   │   ├── __init__.py
+│   │   │   └── schema.py
+│   │   ├── main.py
+│   │   ├── requirements.txt
+│   │   └── routes
+│   │       ├── __init__.py
+│   │       └── market.py
+│   ├── ollama
+│   └── postgres
+│       └── init
+│           └── 01-init-timescaledb.sql
+├── solar-finance-core.txt
+└── tmp
+    ├── filesstep2
+    │   ├── __init__.py
+    │   └── schema.py
+    ├── filesstep2.zip
+    └── market.py
+
+11 directories, 19 files
