@@ -5,7 +5,12 @@ Task 2 — Phase 3 scope:
   - GET  /market/btc/raw            fetch BTC price from Binance (no DB)
   - POST /market/btc/snapshot       fetch BTC + persist to TimescaleDB
   - GET  /market/btc/latest         read most recent persisted tick
-  - GET  /market/btc/history        read last N persisted ticks (NEW)
+  - GET  /market/btc/history        read last N persisted ticks
+
+Sprint 4.5 addition (Deterministic Indicator Foundation):
+  - GET  /market/btc/indicators     SMA20, SMA50, volatility, distances
+                                    computed from last 51 ticks in DB.
+                                    Math only — no signals, no AI.
 
 Design notes:
   - Uses the shared httpx.AsyncClient from app.state.
@@ -14,6 +19,8 @@ Design notes:
   - history endpoint is bounded: 1 <= limit <= 1000, default 100.
     FastAPI's Query() validation rejects out-of-range values with
     422 before they reach the handler — no runtime guard needed.
+  - indicators endpoint uses LIMIT 51 (50 for SMA + 1 prior tick for
+    returns), hitting the existing idx_market_ticks_symbol_ts index.
 
 Strictly out of scope:
   - background scheduler / auto-snapshot
@@ -21,11 +28,15 @@ Strictly out of scope:
   - candle aggregation (OHLC)
   - cursor / offset / since pagination
   - retry / cache / rate limiting
+  - RSI, MACD, EMA, Bollinger, signals, AI analysis
 """
 
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+
+from indicators import sma, volatility_pct, distance_to_sma_pct
 
 router = APIRouter(prefix="/market", tags=["market"])
 
@@ -164,3 +175,82 @@ async def get_btc_history(
         {"ts": r["ts"].isoformat(), "price": float(r["price"])}
         for r in rows
     ]
+
+
+# --- Sprint 4.5: deterministic indicators ---------------------------
+
+# Window sizes (kept as module constants for clarity and easy review).
+# 51 = 50 prices for SMA50 + 1 extra prior tick so we can compute 50 returns
+# for the volatility window.
+SMA_SHORT_WINDOW = 20
+SMA_LONG_WINDOW = 50
+VOL_WINDOW = 50
+LOOKBACK_LIMIT = SMA_LONG_WINDOW + 1  # 51
+
+
+@router.get("/btc/indicators")
+async def get_btc_indicators(request: Request):
+    """
+    Deterministic indicators over the last 51 BTC ticks from market_ticks.
+
+    Pure math layer — no signals, no AI, no recommendations.
+    Returns 200 with nullable fields when ticks are insufficient.
+    Returns 404 only when the ticks table is empty for BTCUSDT.
+    Returns 503 on DB failure.
+
+    Response shape:
+        {
+          "symbol": "BTCUSDT",
+          "price": float,
+          "sma20": float|null,
+          "sma50": float|null,
+          "volatility_pct": float|null,
+          "distance_to_sma20_pct": float|null,
+          "distance_to_sma50_pct": float|null,
+          "ticks_used": int,
+          "ts": str (ISO-8601 UTC)
+        }
+    """
+    try:
+        async with request.app.state.pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT price
+                FROM market_ticks
+                WHERE symbol = $1
+                ORDER BY ts DESC
+                LIMIT $2
+                """,
+                SYMBOL_BTC,
+                LOOKBACK_LIMIT,
+            )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"db read failed: {exc}",
+        )
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="no ticks stored yet — call POST /market/btc/snapshot first",
+        )
+
+    # DB returned newest-first; indicator functions expect chronological order.
+    prices = [float(r["price"]) for r in reversed(rows)]
+    price_now = prices[-1]
+
+    sma_short = sma(prices, SMA_SHORT_WINDOW)
+    sma_long = sma(prices, SMA_LONG_WINDOW)
+
+    return {
+        "symbol": SYMBOL_BTC,
+        "price": price_now,
+        "sma20": sma_short,
+        "sma50": sma_long,
+        "volatility_pct": volatility_pct(prices, window=VOL_WINDOW),
+        "distance_to_sma20_pct": distance_to_sma_pct(price_now, sma_short),
+        "distance_to_sma50_pct": distance_to_sma_pct(price_now, sma_long),
+        "ticks_used": len(prices),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
