@@ -34,3 +34,11 @@ logs/
 
 # Docker
 docker-compose.override.yml
+
+# Solar Dev Pipeline — local working dirs (never commit)
+.solar-backups/
+.solar-bundles/
+.solar-history/
+
+# Sprint transport archives (delivered as PR artifacts, not committed)
+sprint-*.tar.gz

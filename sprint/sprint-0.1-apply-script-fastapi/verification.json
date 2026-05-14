@@ -1,0 +1,40 @@
+{
+  "title": "Sprint 0.1 — solar-apply.js FastAPI adaptation",
+  "checks": [
+    {
+      "name": "Script syntax is valid Node.js",
+      "url": "node -c solar-apply.js && echo OK",
+      "what": "Prints OK (no parse errors)"
+    },
+    {
+      "name": "Help screen renders without args",
+      "url": "node solar-apply.js",
+      "what": "Shows 'Solar Dev Pipeline v4 (FastAPI edition)' usage block, exits 1"
+    },
+    {
+      "name": "History mode works on empty repo",
+      "url": "node solar-apply.js --history",
+      "what": "Either prints 'No history yet.' or lists previous tasks. Exits 0."
+    },
+    {
+      "name": "Dry-run on a real archive (no writes)",
+      "url": "node solar-apply.js sprint-0.1-apply-script-fastapi.tar.gz --dry",
+      "what": "Shows audit + per-file diff, never writes to disk. Skips build & git."
+    },
+    {
+      "name": "Health probe calls make health, not curl",
+      "url": "grep -n \"execSync('make health'\" solar-apply.js",
+      "what": "Returns at least one match — confirms FastAPI-native health probe."
+    },
+    {
+      "name": "Build step calls make rebuild, not pnpm",
+      "url": "grep -n \"'make', \\['rebuild'\\]\" solar-apply.js",
+      "what": "Returns one match — confirms Python/Docker build path."
+    },
+    {
+      "name": "PORT default is 8000",
+      "url": "grep -n \"PORT.*||.*'8000'\" solar-apply.js",
+      "what": "Returns one match — confirms FastAPI port default."
+    }
+  ]
+}
