@@ -12,6 +12,12 @@ Sprint 4.5 addition (Deterministic Indicator Foundation):
                                     computed from last 51 ticks in DB.
                                     Math only — no signals, no AI.
 
+Sprint 5 refactor (Reasoning Layer prep):
+  - compute_btc_indicators(pool) helper extracted so the new
+    /market/btc/regime endpoint can build its prompt from the
+    exact same payload, in-process, with no HTTP self-call.
+  - GET /market/btc/indicators is now a thin shell over this helper.
+
 Design notes:
   - Uses the shared httpx.AsyncClient from app.state.
   - REST semantics: GET never writes, POST writes.
@@ -32,7 +38,7 @@ Strictly out of scope:
 """
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -188,6 +194,57 @@ VOL_WINDOW = 50
 LOOKBACK_LIMIT = SMA_LONG_WINDOW + 1  # 51
 
 
+async def compute_btc_indicators(pg_pool) -> Optional[dict[str, Any]]:
+    """
+    Sprint 5 shared helper.
+
+    Compute the deterministic indicator JSON for BTC from the last
+    LOOKBACK_LIMIT ticks in market_ticks. Returns the dict that
+    /market/btc/indicators serves, or None when the table is empty.
+
+    Raises asyncpg / connection errors to the caller; they are
+    responsible for mapping to HTTP 503.
+
+    This helper is the single source of truth for the indicator
+    payload — both /btc/indicators (HTTP) and /btc/regime (LLM
+    prompt) consume its output.
+    """
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT price
+            FROM market_ticks
+            WHERE symbol = $1
+            ORDER BY ts DESC
+            LIMIT $2
+            """,
+            SYMBOL_BTC,
+            LOOKBACK_LIMIT,
+        )
+
+    if not rows:
+        return None
+
+    # DB returned newest-first; indicator functions expect chronological order.
+    prices = [float(r["price"]) for r in reversed(rows)]
+    price_now = prices[-1]
+
+    sma_short = sma(prices, SMA_SHORT_WINDOW)
+    sma_long = sma(prices, SMA_LONG_WINDOW)
+
+    return {
+        "symbol": SYMBOL_BTC,
+        "price": price_now,
+        "sma20": sma_short,
+        "sma50": sma_long,
+        "volatility_pct": volatility_pct(prices, window=VOL_WINDOW),
+        "distance_to_sma20_pct": distance_to_sma_pct(price_now, sma_short),
+        "distance_to_sma50_pct": distance_to_sma_pct(price_now, sma_long),
+        "ticks_used": len(prices),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @router.get("/btc/indicators")
 async def get_btc_indicators(request: Request):
     """
@@ -212,45 +269,17 @@ async def get_btc_indicators(request: Request):
         }
     """
     try:
-        async with request.app.state.pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT price
-                FROM market_ticks
-                WHERE symbol = $1
-                ORDER BY ts DESC
-                LIMIT $2
-                """,
-                SYMBOL_BTC,
-                LOOKBACK_LIMIT,
-            )
+        payload = await compute_btc_indicators(request.app.state.pg_pool)
     except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail=f"db read failed: {exc}",
         )
 
-    if not rows:
+    if payload is None:
         raise HTTPException(
             status_code=404,
             detail="no ticks stored yet — call POST /market/btc/snapshot first",
         )
 
-    # DB returned newest-first; indicator functions expect chronological order.
-    prices = [float(r["price"]) for r in reversed(rows)]
-    price_now = prices[-1]
-
-    sma_short = sma(prices, SMA_SHORT_WINDOW)
-    sma_long = sma(prices, SMA_LONG_WINDOW)
-
-    return {
-        "symbol": SYMBOL_BTC,
-        "price": price_now,
-        "sma20": sma_short,
-        "sma50": sma_long,
-        "volatility_pct": volatility_pct(prices, window=VOL_WINDOW),
-        "distance_to_sma20_pct": distance_to_sma_pct(price_now, sma_short),
-        "distance_to_sma50_pct": distance_to_sma_pct(price_now, sma_long),
-        "ticks_used": len(prices),
-        "ts": datetime.now(timezone.utc).isoformat(),
-    }
+    return payload
