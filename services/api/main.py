@@ -12,6 +12,9 @@ Endpoints:
   GET  /market/btc/raw         — fetch BTC price from Binance (no DB)
   POST /market/btc/snapshot    — fetch BTC and persist to TimescaleDB
   GET  /market/btc/latest      — read most recent persisted tick
+  GET  /market/btc/history     — read last N persisted ticks
+  GET  /market/btc/indicators  — deterministic SMA/volatility (Sprint 4.5)
+  GET  /market/btc/regime      — Qwen regime classification (Sprint 5)
 """
 
 import logging
@@ -26,6 +29,7 @@ from fastapi.responses import JSONResponse
 from config import settings
 from db.schema import init_schema
 from routes.market import router as market_router
+from routes.regime import router as regime_router
 
 logging.basicConfig(
     level=settings.API_LOG_LEVEL.upper(),
@@ -69,11 +73,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Solar Finance Core",
     description="Decision System for Crypto Treasury",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
 app.include_router(market_router)
+app.include_router(regime_router)
 
 
 # --- Root -----------------------------------------------------------
@@ -82,7 +87,7 @@ app.include_router(market_router)
 async def root():
     return {
         "service": "solar-finance-core",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "environment": settings.ENVIRONMENT,
         "status": "ok",
     }
