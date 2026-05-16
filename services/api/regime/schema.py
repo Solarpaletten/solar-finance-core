@@ -9,6 +9,19 @@ Sprint 5.1 changes (vs Sprint 5):
   - ALLOWED_RISK_FLAGS introduced — closed ontology for risk_flags
   - LLM_VISIBLE_REGIMES separated from system-only INSUFFICIENT_DATA
 
+Sprint 6 changes (Smart Cache Layer):
+  - RegimeResponse now carries cache transparency fields:
+      computed_at        when the regime was actually computed
+                         (the source_ts of the indicators at compute time)
+      served_at          when this particular response was assembled
+                         (now, populated server-side at every request)
+      cache_age_seconds  served_at - computed_at, in seconds
+  - These let the frontend display freshness ("Updated 12s ago") and
+    let auditors verify the cache layer works as designed.
+  - The `cached` flag still distinguishes a true cache hit from a
+    fresh compute; the new fields are present in BOTH cases for
+    consistency.
+
 Single source of truth for:
   - allowed regime values (with explicit LLM vs system layering)
   - forbidden vocabulary that Qwen must NEVER produce
@@ -118,6 +131,16 @@ class LLMRegimeOutput(BaseModel):
 class RegimeResponse(BaseModel):
     """
     Final API response shape for GET /market/btc/regime.
+
+    Sprint 6 transparency fields:
+      computed_at        ISO-8601 UTC, when the regime was originally
+                         computed (the source_ts at compute time).
+                         Stable across cache hits — identifies the
+                         data the reasoning was based on.
+      served_at          ISO-8601 UTC, when this response was
+                         assembled. Different on every request.
+      cache_age_seconds  served_at - computed_at, rounded to int.
+                         Zero on a fresh compute, grows on cache hits.
     """
 
     symbol: str
@@ -129,6 +152,10 @@ class RegimeResponse(BaseModel):
     model: str
     cached: bool = False
     ticks_used: int
+    # Sprint 6 — cache transparency
+    computed_at: str
+    served_at: str
+    cache_age_seconds: int
 
 
 # ─── Helpers ────────────────────────────────────────────────────

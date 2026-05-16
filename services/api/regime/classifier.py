@@ -1,16 +1,32 @@
 """
-Solar Finance Core — Regime Classifier (Sprint 5.1)
+Solar Finance Core — Regime Classifier (Sprint 5.1, Sprint 6 cache fix)
 
 Sprint 5.1 changes (vs Sprint 5):
   - SYSTEM_PROMPT replaced with Solana v2 (production-grade)
   - num_ctx reduced from 32768 to 4096 (fixes OOM on Qwen 72B)
   - Regime validation switched from ALLOWED_REGIMES to LLM_VISIBLE_REGIMES
-    (LLM is not supposed to emit INSUFFICIENT_DATA — that's system-only)
   - risk_flags cleaned via clean_risk_flags (soft enforcement of ontology)
+  - timeout_seconds default raised to 300 (paired with 32B model switch)
+
+Sprint 6 changes (Smart Cache Layer):
+  - Cache key strategy: regime:btc:{source_ts}
+      Where source_ts now equals the *latest tick's timestamp* in DB
+      (changed in routes/market.py). This is what Dashka approved as
+      "Strategy A": cache key follows the data, not the wall clock.
+      Result: identical-data requests share a cache entry, fresh
+      ticks invalidate it naturally.
+  - CACHE_TTL_SECONDS raised from 60 → 90.
+      90s gives comfortable overlap with the (future Sprint 7)
+      scheduler tick interval and protects against scheduler hiccups.
+  - Cache transparency fields populated:
+      computed_at        — wall clock when regime was actually computed
+                           (persists across cache hits)
+      served_at          — wall clock at this exact response
+      cache_age_seconds  — served_at minus computed_at, in seconds
 
 Orchestrates the regime classification pipeline:
 
-  1. Check Redis cache by source_ts (TTL 60s)
+  1. Check Redis cache by source_ts (TTL 90s)
   2. Hard-classify INSUFFICIENT_DATA if ticks < threshold
   3. If miss → build prompt from indicators → call Qwen with num_ctx=4096
   4. Validate output against schema + forbidden-word scan
@@ -21,6 +37,7 @@ Orchestrates the regime classification pipeline:
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from pydantic import ValidationError
@@ -65,17 +82,24 @@ class ClassifierBadOutputError(Exception):
 # ─── Cache layer ────────────────────────────────────────────────
 
 CACHE_KEY_PREFIX = "regime:btc:"
-CACHE_TTL_SECONDS = 60
+
+# Sprint 6: 90s. Designed for a 30s scheduler tick (Sprint 7) with
+# generous overlap so a missed/delayed scheduler run doesn't blank
+# the dashboard. With Strategy A (cache key = latest_tick_ts), entries
+# also self-invalidate as soon as a fresh tick arrives.
+CACHE_TTL_SECONDS = 600
 
 # Qwen call configuration — num_ctx reduced for Sprint 5.1.
-# Our prompt + payload is ~1.5 KB; 4096 tokens is plenty and
-# keeps the KV cache footprint small enough for 72B Q4_K_M on M4.
 QWEN_NUM_CTX = 4096
 
 
 def _cache_key(source_ts: str) -> str:
-    # source_ts is an ISO8601 string; we trust it because it was
-    # produced server-side in /btc/indicators (not user input).
+    """Build the Redis cache key from source_ts.
+
+    Sprint 6: source_ts now equals the latest tick's ts in DB
+    (see routes/market.py: compute_btc_indicators). Identical data
+    -> identical key -> cache hit. Fresh tick -> new key -> cache miss.
+    """
     return f"{CACHE_KEY_PREFIX}{source_ts}"
 
 
@@ -109,14 +133,29 @@ async def _cache_set(redis_client, source_ts: str, payload: dict) -> None:
         log.warning("cache set failed: %s", exc)
 
 
+# ─── Time helpers (Sprint 6) ────────────────────────────────────
+
+def _now_iso() -> str:
+    """Current UTC time as ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _age_seconds(computed_at: str, served_at: str) -> int:
+    """Compute integer seconds between two ISO-8601 timestamps.
+
+    Returns 0 on parse failure so the field is always a valid int.
+    """
+    try:
+        a = datetime.fromisoformat(computed_at)
+        b = datetime.fromisoformat(served_at)
+        delta = (b - a).total_seconds()
+        return max(0, int(delta))
+    except Exception as exc:
+        log.warning("age compute failed: %s", exc)
+        return 0
+
+
 # ─── Prompt v2 (Solana, Dashka approved) ────────────────────────
-# Production-grade prompt. Key properties:
-#   - Constrained regime ontology (7 LLM-visible values, NO mention
-#     of INSUFFICIENT_DATA — that's our internal fallback)
-#   - Closed risk_flags ontology (10 values)
-#   - Wider forbidden-word list (13 words enforced at runtime too)
-#   - Single-sentence factual summary, no speculation
-#   - Strict JSON-only output
 
 SYSTEM_PROMPT = """You are a deterministic market regime classifier.
 
@@ -182,8 +221,11 @@ async def classify_regime(
     """
     Produce a RegimeResponse for the given indicators payload.
 
-    Cache hit → return cached response with cached=True.
-    Cache miss → call Qwen, validate, store, return cached=False.
+    Cache hit  → return cached payload with `cached=True`,
+                 fresh `served_at`, recomputed `cache_age_seconds`.
+                 `computed_at` is preserved from the cached entry.
+    Cache miss → call Qwen, validate, set both `computed_at` and
+                 `served_at` to now, age = 0, store, return.
 
     Raises:
         ClassifierTimeoutError
@@ -195,9 +237,8 @@ async def classify_regime(
     ticks_used = int(indicators.get("ticks_used", 0))
 
     # ─── Hard short-circuit on starved input ────────────────────
-    # If we don't have enough ticks, do not even ask Qwen.
-    # Deterministic, fast, audit-friendly.
     if ticks_used < MIN_TICKS_FOR_CLASSIFICATION:
+        now = _now_iso()
         return RegimeResponse(
             symbol=symbol,
             regime="INSUFFICIENT_DATA",
@@ -211,20 +252,31 @@ async def classify_regime(
             model=model,
             cached=False,
             ticks_used=ticks_used,
+            computed_at=now,
+            served_at=now,
+            cache_age_seconds=0,
         )
 
     # ─── Cache lookup ───────────────────────────────────────────
     cached = await _cache_get(redis_client, source_ts) if source_ts else None
     if cached is not None:
         try:
+            # Build a fresh response from the cached payload, updating
+            # the per-request fields: cached=True, served_at=now,
+            # cache_age_seconds = now - computed_at.
+            served_at = _now_iso()
+            cached["cached"] = True
+            cached["served_at"] = served_at
+            cached["cache_age_seconds"] = _age_seconds(
+                cached.get("computed_at", served_at), served_at
+            )
             response = RegimeResponse(**cached)
-            response.cached = True
             return response
         except ValidationError as exc:
             # Corrupted cache entry — recompute.
             log.warning("cache entry failed schema: %s", exc)
 
-    # ─── Call Qwen with bounded context (Sprint 5.1: num_ctx=4096) ─
+    # ─── Call Qwen with bounded context ─────────────────────────
     try:
         raw = await call_qwen_json(
             http_client=http_client,
@@ -242,7 +294,6 @@ async def classify_regime(
     except QwenBadOutputError as exc:
         raise ClassifierBadOutputError(str(exc)) from exc
     except QwenError as exc:
-        # Future-proof: any new QwenError subclass we forgot about.
         raise ClassifierBadOutputError(str(exc)) from exc
 
     # ─── Schema validation ──────────────────────────────────────
@@ -263,12 +314,9 @@ async def classify_regime(
     # ─── Risk flags: soft enforcement of closed ontology ────────
     cleaned_flags = clean_risk_flags(validated.risk_flags)
 
-    # ─── Regime taxonomy check (Sprint 5.1: LLM_VISIBLE_REGIMES) ─
-    # LLM is allowed to pick only from the 7 visible regimes.
-    # INSUFFICIENT_DATA is reserved for system use; if LLM picks it
-    # (e.g. defensively), we treat that as an out-of-set fallback too.
+    # ─── Regime taxonomy check ──────────────────────────────────
+    now = _now_iso()
     if validated.regime not in LLM_VISIBLE_REGIMES:
-        # Graceful fallback per Dashka V2 matrix: degrade, don't fail.
         log.warning(
             "qwen returned out-of-set regime=%r; falling back",
             validated.regime,
@@ -286,9 +334,11 @@ async def classify_regime(
             model=model,
             cached=False,
             ticks_used=ticks_used,
+            computed_at=now,
+            served_at=now,
+            cache_age_seconds=0,
         )
-        # We do NOT cache invalid-regime fallbacks — next call may
-        # produce a valid one (e.g. after re-warm of the model).
+        # Do NOT cache invalid-regime fallbacks.
         return response
 
     response = RegimeResponse(
@@ -301,10 +351,16 @@ async def classify_regime(
         model=model,
         cached=False,
         ticks_used=ticks_used,
+        computed_at=now,
+        served_at=now,
+        cache_age_seconds=0,
     )
 
     # ─── Cache the good answer ──────────────────────────────────
     if source_ts:
+        # Persist with cached=False so reads through _cache_get see
+        # the source-of-truth shape; classify_regime patches cached=True
+        # at hit time. computed_at is preserved verbatim.
         await _cache_set(redis_client, source_ts, response.model_dump())
 
     return response
