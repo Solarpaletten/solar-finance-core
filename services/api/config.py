@@ -3,6 +3,17 @@ Solar Finance Core — API Configuration
 
 Loads settings from environment variables. Pydantic validates types.
 No secrets hardcoded.
+
+Sprint 5.1 change:
+  - Default OLLAMA_MODEL switched from 72B to 32B (qwen2.5:32b-instruct-q4_K_M)
+  - Rationale: 72B on M4 Pro hit hardware ceiling — JSON-constrained
+    inference exceeded 5 minutes per call. 32B fits comfortably in
+    available memory, with warm inference target <60s, enabling
+    real-time-ish UX through the cache layer (Sprint 7).
+  - The 72B model remains available in Ollama for future migrations
+    (e.g., heavier hardware or background chronicle compute).
+  - This is the *default*. Production deployment may override via
+    OLLAMA_MODEL env var.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -25,7 +36,7 @@ class Settings(BaseSettings):
     # Ollama
     OLLAMA_HOST: str = "ollama"
     OLLAMA_PORT: int = 11434
-    OLLAMA_MODEL: str = "qwen2.5:72b-instruct-q4_K_M"
+    OLLAMA_MODEL: str = "qwen2.5:32b-instruct-q4_K_M"
 
     # API
     API_LOG_LEVEL: str = "info"

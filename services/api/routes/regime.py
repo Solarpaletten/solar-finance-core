@@ -1,6 +1,13 @@
 """
 Solar Finance Core — Regime Classification Route (Sprint 5)
 
+Sprint 5.1 change:
+  - timeout_seconds explicit value raised 120 → 300 seconds.
+  - Pairs with the 32B model switch in Sprint 5.1: 32B normally
+    completes warm inference in 10-60s, but cold-start under M4
+    memory pressure can stretch close to 2 minutes. 300s gives a
+    comfortable floor.
+
 GET /market/btc/regime — orchestrates:
   1. compute deterministic indicators (shared helper from routes.market)
   2. classify regime via Qwen with cache + fallback
@@ -75,7 +82,7 @@ async def get_btc_regime(request: Request):
             redis_client=request.app.state.redis,
             ollama_url=settings.ollama_url,
             model=settings.OLLAMA_MODEL,
-            timeout_seconds=120.0,
+            timeout_seconds=300.0,
         )
     except ClassifierTimeoutError as exc:
         log.warning("/btc/regime LLM timeout: %s", exc)

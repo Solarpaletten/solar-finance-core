@@ -1,6 +1,14 @@
 """
 Solar Finance Core — Qwen / Ollama adapter (Sprint 5)
 
+Sprint 5.1 change:
+  - Default timeout_seconds raised from 120 → 300.
+  - num_ctx default kept at 4096 (was reduced from 32768 in Sprint 5).
+  - These defaults pair with the 32B model switch in Sprint 5.1.
+    Even though 32B is faster, we keep a generous timeout floor so
+    cold-start inference (model load + first KV-cache fill) doesn't
+    spuriously trip 504s during M4 memory pressure spikes.
+
 Thin wrapper around the Ollama /api/generate endpoint that:
   - calls Qwen with deterministic options (temperature=0, seed=42)
   - uses Ollama's native `format: "json"` to coerce JSON output
@@ -56,8 +64,8 @@ async def call_qwen_json(
     model: str,
     system_prompt: str,
     user_prompt: str,
-    timeout_seconds: float = 120.0,
-    num_ctx: int = 32768,
+    timeout_seconds: float = 300.0,
+    num_ctx: int = 4096,
 ) -> dict[str, Any]:
     """
     Call Qwen on Ollama and return its JSON response as a dict.
@@ -68,9 +76,12 @@ async def call_qwen_json(
         model:           model name from settings.OLLAMA_MODEL
         system_prompt:   system instructions
         user_prompt:     user payload (typically JSON of indicators)
-        timeout_seconds: hard timeout for the call (default 120s,
-                         tuned for Q4_K_M on M4 Pro warm path)
-        num_ctx:         context window passed to Ollama
+        timeout_seconds: hard timeout for the call (default 300s,
+                         tuned for cold-start inference on 32B Q4_K_M
+                         under memory pressure on M4 Pro; warm calls
+                         normally complete in 10–60s).
+        num_ctx:         context window passed to Ollama (default
+                         4096; payload + prompt fit comfortably).
 
     Returns:
         dict parsed from Qwen's JSON output.

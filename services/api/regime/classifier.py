@@ -1,18 +1,22 @@
 """
-Solar Finance Core — Regime Classifier (Sprint 5)
+Solar Finance Core — Regime Classifier (Sprint 5.1)
+
+Sprint 5.1 changes (vs Sprint 5):
+  - SYSTEM_PROMPT replaced with Solana v2 (production-grade)
+  - num_ctx reduced from 32768 to 4096 (fixes OOM on Qwen 72B)
+  - Regime validation switched from ALLOWED_REGIMES to LLM_VISIBLE_REGIMES
+    (LLM is not supposed to emit INSUFFICIENT_DATA — that's system-only)
+  - risk_flags cleaned via clean_risk_flags (soft enforcement of ontology)
 
 Orchestrates the regime classification pipeline:
 
   1. Check Redis cache by source_ts (TTL 60s)
-  2. If miss → build prompt from indicators → call Qwen
-  3. Validate output against schema + forbidden-word scan
-  4. Map invalid LLM output to graceful fallback (INSUFFICIENT_DATA
+  2. Hard-classify INSUFFICIENT_DATA if ticks < threshold
+  3. If miss → build prompt from indicators → call Qwen with num_ctx=4096
+  4. Validate output against schema + forbidden-word scan
+  5. Map invalid LLM output to graceful fallback (INSUFFICIENT_DATA
      with risk_flag), never crash
-  5. Cache successful classifications
-
-Prompt template:
-  ⚠️  TEMPORARY v1 — drafted by Claude per Dashka's "no deadlock"
-      rule. Owned by Solana for refinement in a follow-up sprint.
+  6. Cache successful classifications
 """
 
 import json
@@ -29,10 +33,11 @@ from llm.qwen_client import (
     call_qwen_json,
 )
 from regime.schema import (
-    ALLOWED_REGIMES,
     LLMRegimeOutput,
+    LLM_VISIBLE_REGIMES,
     MIN_TICKS_FOR_CLASSIFICATION,
     RegimeResponse,
+    clean_risk_flags,
     contains_forbidden_word,
 )
 
@@ -61,6 +66,11 @@ class ClassifierBadOutputError(Exception):
 
 CACHE_KEY_PREFIX = "regime:btc:"
 CACHE_TTL_SECONDS = 60
+
+# Qwen call configuration — num_ctx reduced for Sprint 5.1.
+# Our prompt + payload is ~1.5 KB; 4096 tokens is plenty and
+# keeps the KV cache footprint small enough for 72B Q4_K_M on M4.
+QWEN_NUM_CTX = 4096
 
 
 def _cache_key(source_ts: str) -> str:
@@ -99,41 +109,55 @@ async def _cache_set(redis_client, source_ts: str, payload: dict) -> None:
         log.warning("cache set failed: %s", exc)
 
 
-# ─── Prompt construction (TEMPORARY v1) ─────────────────────────
-# Solana — refine this in the next sprint. Goal of v1: minimal
-# instruction set that produces conformant JSON with deterministic
-# regime labels under temperature=0, seed=42.
+# ─── Prompt v2 (Solana, Dashka approved) ────────────────────────
+# Production-grade prompt. Key properties:
+#   - Constrained regime ontology (7 LLM-visible values, NO mention
+#     of INSUFFICIENT_DATA — that's our internal fallback)
+#   - Closed risk_flags ontology (10 values)
+#   - Wider forbidden-word list (13 words enforced at runtime too)
+#   - Single-sentence factual summary, no speculation
+#   - Strict JSON-only output
 
-SYSTEM_PROMPT = """You are a deterministic market state classifier.
+SYSTEM_PROMPT = """You are a deterministic market regime classifier.
 
-You receive a JSON object with pre-computed market indicators for a single \
-crypto symbol. Your only job is to classify the current market regime and \
-respond with a single JSON object — nothing else.
+Your only job is to analyze pre-computed mathematical indicators for a single \
+crypto symbol and return a structured JSON describing the current market state.
 
-Allowed regime values (use EXACTLY one of these, uppercase):
-  - TRENDING_UP        clear upward drift, price above both SMAs, positive distances
-  - TRENDING_DOWN      clear downward drift, price below both SMAs, negative distances
-  - CONSOLIDATING      low volatility, price near SMAs, small absolute distances
-  - VOLATILE_NEUTRAL   elevated volatility with no clear direction
-  - INSUFFICIENT_DATA  not enough information to classify confidently
+Allowed regimes (choose EXACTLY one, uppercase, nothing else):
+  - CONSOLIDATING       low volatility, price tightly between SMA20 and SMA50
+  - BULLISH_MOMENTUM    price above both SMAs with positive distances, moderate volatility
+  - BEARISH_PRESSURE    price below both SMAs with negative distances
+  - BREAKOUT_ATTEMPT    sharp expansion in distance to nearest SMA with rising volatility
+  - HIGH_VOLATILITY     volatility_pct above 3.5 with no clear directional bias
+  - RANGE_EXPANSION     SMA20/SMA50 gap widening quickly
+  - VOLATILE_NEUTRAL    high volatility but price oscillates around the SMAs without direction
 
-Strict rules:
-  - NEVER use the words: buy, sell, long, short, entry, target, guarantee.
-  - NEVER give advice, recommendations, predictions, or price targets.
+Suggested numeric guides (not strict, use judgement):
+  - volatility_pct < 0.5  suggests low-vol / CONSOLIDATING
+  - volatility_pct > 3.5  suggests HIGH_VOLATILITY
+  - |distance_to_sma20_pct| > 1.2 and growing suggests BREAKOUT_ATTEMPT
+
+Strict rules — NEVER break these:
+  - NEVER use any of these words: buy, sell, long, short, entry, target,
+    guarantee, forecast, predict, prediction, advice, recommend, recommendation.
+  - NEVER give advice, opinions, predictions, or price targets.
   - NEVER speculate about future moves.
   - Describe ONLY the current observed state.
   - confidence is a float in [0.0, 1.0] reflecting how cleanly the indicators
-    match your chosen regime, not a prediction of future accuracy.
-  - summary is one short sentence (max 200 chars) describing the observed state.
-  - risk_flags is a list of short snake_case tokens, e.g. low_volatility,
-    range_compression, near_sma_cluster. Maximum 5 flags. Empty list is fine.
+    match your chosen regime. It is NOT a prediction of future accuracy.
+  - summary is at most two short factual sentences (max 200 chars total).
+  - risk_flags must be chosen ONLY from this closed set:
+        low_volatility, high_volatility, range_compression,
+        near_sma_cluster, breakout_potential, squeeze_potential,
+        bearish_pressure, bullish_momentum, expansion_phase, unstable
+    Maximum 5 flags. Empty list is acceptable.
 
-Output schema (the ONLY thing you may return):
+Output schema (the ONLY thing you may return — pure JSON, no prose):
 {
-  "regime": "<one of the allowed values>",
+  "regime": "<one of the 7 allowed values>",
   "confidence": <float 0.0..1.0>,
-  "summary": "<short observational sentence>",
-  "risk_flags": ["<snake_case_token>", ...]
+  "summary": "<one or two short observational sentences>",
+  "risk_flags": ["<snake_case_token from ontology>", ...]
 }
 """
 
@@ -153,7 +177,7 @@ async def classify_regime(
     redis_client,
     ollama_url: str,
     model: str,
-    timeout_seconds: float = 120.0,
+    timeout_seconds: float = 300.0,
 ) -> RegimeResponse:
     """
     Produce a RegimeResponse for the given indicators payload.
@@ -182,7 +206,7 @@ async def classify_regime(
                 f"Only {ticks_used} ticks available; "
                 f"need {MIN_TICKS_FOR_CLASSIFICATION} for classification."
             ),
-            risk_flags=["insufficient_history"],
+            risk_flags=["unstable"],
             source_ts=source_ts,
             model=model,
             cached=False,
@@ -200,7 +224,7 @@ async def classify_regime(
             # Corrupted cache entry — recompute.
             log.warning("cache entry failed schema: %s", exc)
 
-    # ─── Call Qwen ──────────────────────────────────────────────
+    # ─── Call Qwen with bounded context (Sprint 5.1: num_ctx=4096) ─
     try:
         raw = await call_qwen_json(
             http_client=http_client,
@@ -209,6 +233,7 @@ async def classify_regime(
             system_prompt=SYSTEM_PROMPT,
             user_prompt=_user_prompt(indicators),
             timeout_seconds=timeout_seconds,
+            num_ctx=QWEN_NUM_CTX,
         )
     except QwenTimeoutError as exc:
         raise ClassifierTimeoutError(str(exc)) from exc
@@ -235,8 +260,14 @@ async def classify_regime(
             f"qwen output contained forbidden word: {bad_word!r}"
         )
 
-    # ─── Regime taxonomy check ──────────────────────────────────
-    if validated.regime not in ALLOWED_REGIMES:
+    # ─── Risk flags: soft enforcement of closed ontology ────────
+    cleaned_flags = clean_risk_flags(validated.risk_flags)
+
+    # ─── Regime taxonomy check (Sprint 5.1: LLM_VISIBLE_REGIMES) ─
+    # LLM is allowed to pick only from the 7 visible regimes.
+    # INSUFFICIENT_DATA is reserved for system use; if LLM picks it
+    # (e.g. defensively), we treat that as an out-of-set fallback too.
+    if validated.regime not in LLM_VISIBLE_REGIMES:
         # Graceful fallback per Dashka V2 matrix: degrade, don't fail.
         log.warning(
             "qwen returned out-of-set regime=%r; falling back",
@@ -250,7 +281,7 @@ async def classify_regime(
                 "Classifier returned an unrecognised regime; "
                 "degraded to INSUFFICIENT_DATA."
             ),
-            risk_flags=["llm_invalid_regime"],
+            risk_flags=["unstable"],
             source_ts=source_ts,
             model=model,
             cached=False,
@@ -265,7 +296,7 @@ async def classify_regime(
         regime=validated.regime,
         confidence=validated.confidence,
         summary=validated.summary,
-        risk_flags=validated.risk_flags,
+        risk_flags=cleaned_flags,
         source_ts=source_ts,
         model=model,
         cached=False,
