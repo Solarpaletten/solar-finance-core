@@ -87,7 +87,7 @@ CACHE_KEY_PREFIX = "regime:btc:"
 # generous overlap so a missed/delayed scheduler run doesn't blank
 # the dashboard. With Strategy A (cache key = latest_tick_ts), entries
 # also self-invalidate as soon as a fresh tick arrives.
-CACHE_TTL_SECONDS = 90
+CACHE_TTL_SECONDS = 600
 
 # Qwen call configuration — num_ctx reduced for Sprint 5.1.
 QWEN_NUM_CTX = 4096
