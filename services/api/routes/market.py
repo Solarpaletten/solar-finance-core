@@ -16,7 +16,20 @@ Sprint 5 refactor (Reasoning Layer prep):
   - compute_btc_indicators(pool) helper extracted so the new
     /market/btc/regime endpoint can build its prompt from the
     exact same payload, in-process, with no HTTP self-call.
-  - GET /market/btc/indicators is now a thin shell over this helper.
+
+Sprint 6 change (Smart Cache Layer):
+  - `ts` field semantics changed: now reflects the latest tick's
+    timestamp from market_ticks (when the data exists), not the
+    request time (when the endpoint was called).
+  - This is what unlocks deterministic cache keys downstream:
+    `regime:btc:{ts}` will hit cache repeatedly until a NEW tick
+    arrives in the DB.
+  - Justification: `ts = when data exists` is more honest than
+    `ts = when endpoint called`. The latter made every call look
+    unique even when data was identical.
+  - Audit note: this is an API contract change. /btc/indicators
+    `ts` field now updates only when new ticks arrive, not on
+    every request. No external clients exist yet so this is safe.
 
 Design notes:
   - Uses the shared httpx.AsyncClient from app.state.
@@ -33,11 +46,11 @@ Strictly out of scope:
   - other symbols (only BTC for now)
   - candle aggregation (OHLC)
   - cursor / offset / since pagination
-  - retry / cache / rate limiting
+  - retry / cache / rate limiting (in this module — cache lives
+    in regime/classifier.py)
   - RSI, MACD, EMA, Bollinger, signals, AI analysis
 """
 
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -196,7 +209,7 @@ LOOKBACK_LIMIT = SMA_LONG_WINDOW + 1  # 51
 
 async def compute_btc_indicators(pg_pool) -> Optional[dict[str, Any]]:
     """
-    Sprint 5 shared helper.
+    Sprint 5 shared helper, Sprint 6 cache-key fix.
 
     Compute the deterministic indicator JSON for BTC from the last
     LOOKBACK_LIMIT ticks in market_ticks. Returns the dict that
@@ -208,11 +221,18 @@ async def compute_btc_indicators(pg_pool) -> Optional[dict[str, Any]]:
     This helper is the single source of truth for the indicator
     payload — both /btc/indicators (HTTP) and /btc/regime (LLM
     prompt) consume its output.
+
+    Sprint 6 change:
+      The `ts` field now reflects the latest tick's timestamp from
+      the database, not datetime.now(). This makes the payload
+      identity-stable across requests while no new ticks arrive,
+      which is the foundation for deterministic cache keys in
+      /btc/regime.
     """
     async with pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT price
+            SELECT ts, price
             FROM market_ticks
             WHERE symbol = $1
             ORDER BY ts DESC
@@ -225,7 +245,10 @@ async def compute_btc_indicators(pg_pool) -> Optional[dict[str, Any]]:
     if not rows:
         return None
 
-    # DB returned newest-first; indicator functions expect chronological order.
+    # DB returned newest-first. rows[0] is the latest tick.
+    latest_tick_ts = rows[0]["ts"]
+
+    # Indicator functions expect chronological order (oldest -> newest).
     prices = [float(r["price"]) for r in reversed(rows)]
     price_now = prices[-1]
 
@@ -241,7 +264,7 @@ async def compute_btc_indicators(pg_pool) -> Optional[dict[str, Any]]:
         "distance_to_sma20_pct": distance_to_sma_pct(price_now, sma_short),
         "distance_to_sma50_pct": distance_to_sma_pct(price_now, sma_long),
         "ticks_used": len(prices),
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": latest_tick_ts.isoformat(),
     }
 
 
@@ -255,6 +278,10 @@ async def get_btc_indicators(request: Request):
     Returns 404 only when the ticks table is empty for BTCUSDT.
     Returns 503 on DB failure.
 
+    Sprint 6 note: `ts` field now equals the latest tick's ts,
+    not request time. Identical-data calls return identical
+    payloads, enabling downstream caching.
+
     Response shape:
         {
           "symbol": "BTCUSDT",
@@ -265,7 +292,7 @@ async def get_btc_indicators(request: Request):
           "distance_to_sma20_pct": float|null,
           "distance_to_sma50_pct": float|null,
           "ticks_used": int,
-          "ts": str (ISO-8601 UTC)
+          "ts": str (ISO-8601 UTC, latest tick's timestamp)
         }
     """
     try:
