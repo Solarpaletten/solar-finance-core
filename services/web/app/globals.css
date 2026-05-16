@@ -1,0 +1,80 @@
+/* Solar Finance Core — global styles (Sprint 7)
+ *
+ * NASA Mission Control vibe. Dark void background, faint dotted grid
+ * overlay, custom fonts loaded from Google Fonts via @import (no JS
+ * dependency on next/font — keeps the dev surface simple for Sprint 7).
+ */
+
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Major+Mono+Display&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: #070a13;
+  color: #e7e3d6;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  font-feature-settings: "ss01", "tnum";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Faint dotted grid overlay across the whole viewport. Adds depth
+ * without screaming. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    rgba(255, 181, 71, 0.06) 1px,
+    transparent 0
+  );
+  background-size: 24px 24px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Subtle CRT scan-line layer — barely visible, only adds atmosphere */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(231, 227, 214, 0) 0px,
+    rgba(231, 227, 214, 0) 2px,
+    rgba(231, 227, 214, 0.012) 3px,
+    rgba(231, 227, 214, 0) 4px
+  );
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Selection color matches solar.amber for the telemetry vibe */
+::selection {
+  background: rgba(255, 181, 71, 0.35);
+  color: #070a13;
+}
+
+/* Scrollbar styling (WebKit only — graceful for everywhere else) */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #070a13;
+}
+::-webkit-scrollbar-thumb {
+  background: #1a2236;
+  border-radius: 0;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #243049;
+}
