@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// solar-apply.js v4.0 — Solar Dev Pipeline (Python/FastAPI edition)
+// solar-apply.js v5.0 — Solar Dev Pipeline (Python/FastAPI edition)
 // ═══════════════════════════════════════════════════════════════
 //
 // PIPELINE:
@@ -12,6 +12,16 @@
 //   7. Verification      — checkpoints from verification.json + make health
 //   8. History / Bundle  — .solar-history + .solar-bundles
 //   9. Git (3-phase)     — commit → push → optional override
+//
+// CHANGES IN v5.0 (Council request, 16 May 2026):
+//   • NEW key [A] = "apply all remaining NEW files" — appears only
+//     when current file is NEW. Toggles a sticky flag so subsequent
+//     NEW files apply without prompt. PATCH files STILL ask each time
+//     (Kimi audit invariant: PATCH = touching existing code = mandatory diff).
+//   • Sticky state never auto-applies PATCH. To get behavior back to
+//     per-file confirmation, pass --strict.
+//   • All v4 safety invariants preserved: backup, diff display,
+//     compileall, verification.json, rollback path.
 //
 // CHANGES IN v4.0 (Sprint 0.1 — FastAPI adaptation):
 //   • PORT default 8000 (was 3000)
@@ -28,6 +38,7 @@
 // USAGE:
 //   node solar-apply.js sprint-004-sma-engine.tar.gz
 //   node solar-apply.js sprint-004-sma-engine.tar.gz --auto
+//   node solar-apply.js sprint-004-sma-engine.tar.gz --strict   (v5: disable [A])
 //   node solar-apply.js sprint-004-sma-engine.tar.gz --dry
 //   node solar-apply.js sprint-004-sma-engine.tar.gz --no-build
 //   node solar-apply.js sprint-004-sma-engine.tar.gz --no-bundle
@@ -43,6 +54,7 @@ const { execSync, spawnSync } = require('child_process');
 // ─── Args ─────────────────────────────────────────────────────
 const ARCHIVE    = process.argv[2];
 const AUTO       = process.argv.includes('--auto');
+const STRICT     = process.argv.includes('--strict');   // v5: disable [A] key
 const DRY_RUN    = process.argv.includes('--dry');
 const NO_BUILD   = process.argv.includes('--no-build');
 const NO_BUNDLE  = process.argv.includes('--no-bundle');
@@ -737,6 +749,11 @@ async function main() {
   const report   = { created: [], modified: [], dirs: [], diffSummary: [], skipped: 0 };
   const seenDirs = new Set();
 
+  // v5: sticky flag — once architect chose [A], subsequent NEW files
+  // apply without prompting. PATCH files always still ask, regardless.
+  // Disabled by --strict for old behavior.
+  let applyAllNew = false;
+
   for (let i = 0; i < files.length; i++) {
     const rel    = files[i];
     const src    = path.join(tmpDir, rel);
@@ -770,15 +787,41 @@ async function main() {
 
     let ans = 'y';
     if (!AUTO) {
-      ans = (await ask(c(C.bold, '   [Y] apply  [S] skip  [D] diff  [Q] quit  > '))).toLowerCase().trim() || 'y';
-      if (ans === 'd') {
-        exists ? showColorDiff(oldTxt, newTxt) : console.log(c(C.green, '   (new file)'));
-        ans = (await ask(c(C.bold, '   [Y] apply  [S] skip  > '))).toLowerCase().trim() || 'y';
-      }
-      if (ans === 'q') {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-        closeRL();
-        process.exit(0);
+      // v5: if sticky applyAllNew is set AND this file is NEW, skip the prompt.
+      // PATCH files always re-prompt (Kimi invariant: never auto-touch existing code).
+      if (applyAllNew && !exists) {
+        console.log(c(C.dim, '   ↳ auto-applied via [A]'));
+        ans = 'y';
+      } else {
+        // v5: offer [A] only when this file is NEW and --strict not set.
+        const promptStr = (!exists && !STRICT)
+          ? '   [Y] apply  [A] apply all NEW  [S] skip  [D] diff  [Q] quit  > '
+          : '   [Y] apply  [S] skip  [D] diff  [Q] quit  > ';
+        ans = (await ask(c(C.bold, promptStr))).toLowerCase().trim() || 'y';
+
+        if (ans === 'd') {
+          exists ? showColorDiff(oldTxt, newTxt) : console.log(c(C.green, '   (new file)'));
+          ans = (await ask(c(C.bold, '   [Y] apply  [S] skip  > '))).toLowerCase().trim() || 'y';
+        }
+
+        if (ans === 'a' && !exists && !STRICT) {
+          // Engage sticky mode for all subsequent NEW files in this run.
+          applyAllNew = true;
+          console.log(c(C.green, '   ✓ [A] engaged — remaining NEW files will apply automatically'));
+          ans = 'y';
+        } else if (ans === 'a') {
+          // 'a' on a PATCH file (or in --strict mode). [A] wasn't offered,
+          // so treat as a typo. Fall back to normal 'y' apply — diff was
+          // already shown above so the operator has seen what they're
+          // applying.
+          ans = 'y';
+        }
+
+        if (ans === 'q') {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+          closeRL();
+          process.exit(0);
+        }
       }
     }
 
